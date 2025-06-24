@@ -1828,6 +1828,7 @@ from .safari import (
 )
 from .saitosan import SaitosanIE
 from .samplefocus import SampleFocusIE
+from .flomarching import FloMarchingLiveIE
 from .sapo import SapoIE
 from .sbs import SBSIE
 from .sbscokr import (
