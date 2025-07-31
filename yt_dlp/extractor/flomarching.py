@@ -88,8 +88,6 @@ class FloMarchingLiveIE(InfoExtractor):
             raise ExtractorError('Unable to find stream_id for this event')
 
         api_url = f'https://live-api-3.flosports.tv/streams/{stream_id}/tokens'
-        cookies = self._get_cookies('https://www.flomarching.com')
-        token = cookies.get('jwt_token') or cookies.get('authorization') or cookies.get('Authorization')
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:141.0) Gecko/20100101 Firefox/141.0',
             'Accept': 'application/json, text/plain, */*',
@@ -110,12 +108,17 @@ class FloMarchingLiveIE(InfoExtractor):
             'X-301-Location': 'web',
             'x-flo-app': 'flosports-webapp',
         }
+        for cookie in self.cookiejar:
+            if cookie.name == 'jwt_token':
+                token = cookie.value
+                break
         if token:
             headers['Authorization'] = f'Bearer {token}'
-        self.write_debug(f'Authorization header: {headers.get("Authorization")} ')
         data = json.dumps({"adTracking": {"appName": "flosports-web"}}).encode('utf-8')
         from yt_dlp.networking.common import Request
-        request = Request(api_url, data=data, headers=headers, method='POST')
+        request = Request(api_url, data=data, headers=headers)
+        request.get_method = 'POST'  # Ensure the request method is POST
+
         response = self._download_json(
             request, video_id, note='Requesting stream token',
             expected_status=200)
