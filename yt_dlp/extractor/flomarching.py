@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from .common import InfoExtractor
 from ..utils import ExtractorError, urlencode_postdata
 import json
@@ -81,7 +82,7 @@ class FloMarchingLiveIE(InfoExtractor):
                     "Specify --extractor-args \"stream: <stream_name>\" to select a stream."
                 )
 
-        # Fallbacks if stream_code not found
+        # stream id is the one selected
         stream_id = selected_stream_id
 
         if not stream_id:
@@ -135,10 +136,17 @@ class FloMarchingLiveIE(InfoExtractor):
         }
         formats = self._extract_m3u8_formats(
             uri, video_id, 'mp4', m3u8_id='hls', fatal=True, headers=m3u8_headers)
-        title = response.get('data', {}).get('stream', {}).get('name') or f'FloMarching Live Stream {video_id}'
+
+        # Get the title
+        schedule_url = f'https://api.flomarching.com/api/experiences/web/legacy-core/live-events/{video_id}/schedule?site_id=27&version=1.33.2'
+        schedule = self._download_webpage(schedule_url, video_id)
+        title = re.search(r'<h2[^>]>(.*?)</h2>', schedule, re.DOTALL)
+        stream_name = response.get('data', {}).get('strem').get('name')
+        full_title = datetime.now().strftime('%m-%d-%Y') + ' - ' + (title.group(1).strip()) + stream_name
+
         result = {
             'id': video_id,
-            'title': title,
+            'title': full_title,
             'formats': formats,
             'is_live': True,
         }
