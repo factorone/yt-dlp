@@ -6,6 +6,12 @@ import json
 
 class FloMarchingLiveIE(InfoExtractor):
     _VALID_URL = r'https://www.flomarching.com/live/(?P<id>\d+)'
+    _TESTS = [
+        {
+            'url': 'https://www.flomarching.com/live/12345',
+            'only_matching': True,
+        }
+    ]
 
     def _login(self):
         # FloMarching does not support password login; require cookies
@@ -140,9 +146,9 @@ class FloMarchingLiveIE(InfoExtractor):
         # Get the title
         schedule_url = f'https://api.flomarching.com/api/experiences/web/legacy-core/live-events/{video_id}/schedule?site_id=27&version=1.33.2'
         schedule = self._download_webpage(schedule_url, video_id)
-        title = re.search(r'<h2[^>]>(.*?)</h2>', schedule, re.DOTALL)
-        stream_name = response.get('data', {}).get('strem').get('name')
-        full_title = datetime.now().strftime('%m-%d-%Y') + ' - ' + (title.group(1).strip()) + stream_name
+        #title = re.search(r'<h2[^>]>(.*?)</h2>', schedule, re.DOTALL)
+        stream_name = response.get('data', {}).get('stream').get('name')
+        full_title = datetime.now().strftime('%m-%d-%Y') + ' - ' + stream_name
 
         result = {
             'id': video_id,
