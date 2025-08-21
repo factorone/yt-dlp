@@ -92,6 +92,8 @@ class FloMarchingIE(InfoExtractor):
         available_streams = [s.get('name', f'Stream {s.get("id")}') for s in stream_list]
         self.report_warning(f'Stream "{target_name}" not found. Available streams: {", ".join(available_streams)}')
         return stream_list
+
+    def _get_jwt_token(self):
         """Extract JWT token from browser cookies"""
         cookies = self._get_cookies('https://www.flomarching.com')
         jwt_cookie = cookies.get('jwt_token')
