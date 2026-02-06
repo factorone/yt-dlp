@@ -631,6 +631,11 @@ from .floatplane import (
     FloatplaneChannelIE,
     FloatplaneIE,
 )
+from .flosports import (
+    FloMarchingIE,
+    FloRacingIE,
+    FloWrestlingIE,
+)
 from .folketinget import FolketingetIE
 from .footyroom import FootyRoomIE
 from .formula1 import Formula1IE
@@ -1788,7 +1793,6 @@ from .safari import (
 )
 from .saitosan import SaitosanIE
 from .samplefocus import SampleFocusIE
-from .flomarching import FloMarchingLiveIE
 from .sapo import SapoIE
 from .sauceplus import SaucePlusIE
 from .sbs import SBSIE
