@@ -208,8 +208,30 @@ class FloSportsBaseIE(InfoExtractor):
         except Exception as e:
             raise ExtractorError(f'Failed to parse app state JSON: {e}')
 
-        # Extract stream_list
-        stream_list = traverse_obj(app_state, 'stream_list', expected_type=list)
+        # Extract stream data - structure varies between live and VOD
+        # Live events: nested under Firebase URL key -> body -> streams (dict)
+        # VOD: may have stream_list directly
+        stream_list = None
+        event_body = None
+
+        # Try to find Firebase-style nested data first (live events)
+        for key, value in app_state.items():
+            if 'firebaseio.com' in key and isinstance(value, dict):
+                event_body = value.get('body', {})
+                streams_dict = event_body.get('streams', {})
+                if streams_dict and isinstance(streams_dict, dict):
+                    # Convert streams dict to list, adding 'id' from the key
+                    stream_list = [
+                        {'id': stream_id, **stream_data}
+                        for stream_id, stream_data in streams_dict.items()
+                        if stream_data.get('isActive', True)
+                    ]
+                    break
+
+        # Fallback to stream_list if present (older format or VOD)
+        if not stream_list:
+            stream_list = traverse_obj(app_state, 'stream_list', expected_type=list)
+
         if not stream_list:
             raise ExtractorError('No streams found in app state')
 
@@ -217,8 +239,13 @@ class FloSportsBaseIE(InfoExtractor):
         if stream_name:
             stream_list = self._filter_stream_by_name(stream_list, stream_name)
 
-        # Extract metadata from the page
-        title = self._get_event_title(event_id, webpage)
+        # Extract metadata - prefer event_body data if available
+        if event_body:
+            title = event_body.get('name') or event_body.get('shortName')
+        else:
+            title = None
+        if not title:
+            title = self._get_event_title(event_id, webpage)
         description = self._og_search_description(webpage, default=None)
         thumbnail = self._og_search_thumbnail(webpage, default=None)
 
@@ -227,6 +254,7 @@ class FloSportsBaseIE(InfoExtractor):
         subtitles = {}
 
         for stream in stream_list:
+            # API requires numeric stream ID
             stream_id = stream.get('id')
             stream_display_name = stream.get('name', f'Stream {stream_id}')
 
