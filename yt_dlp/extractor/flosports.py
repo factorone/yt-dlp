@@ -169,14 +169,89 @@ class FloSportsBaseIE(InfoExtractor):
             )
         )
 
+    def _extract_vod(self, video_id):
+        """
+        Extract VOD using the public video API.
+
+        The /api/videos/{id} endpoint returns a 'playlist' field pointing to
+        CloudFront, which serves the original HLS manifest with full audio.
+        Flo's player uses the 'playlist_no_audio' (Transmit.live) field instead,
+        which strips audio references from the manifest. No auth required.
+        """
+        api_url = f'https://api.flosports.tv/api/videos/{video_id}'
+        video_data = self._download_json(
+            api_url, video_id,
+            note='Fetching video metadata from FloSports API',
+            fatal=False,
+        )
+
+        if not video_data:
+            return None
+
+        # API wraps response in {"data": {...}}
+        video_info = video_data.get('data', video_data)
+
+        # Prefer CloudFront playlist (has audio) over Transmit.live (stripped)
+        playlist_url = video_info.get('playlist')
+
+        if not playlist_url:
+            self.report_warning(
+                'No CloudFront playlist URL found in video API response. '
+                'Falling back to standard extraction.')
+            return None
+
+        no_audio = video_info.get('no_audio', False)
+        if no_audio:
+            self.to_screen(
+                'Video API claims no_audio=true, but CloudFront playlist '
+                'contains full audio. Using CloudFront URL.')
+
+        title = video_info.get('title', f'{self._FLO_PROPERTY_NAME} Video {video_id}')
+        duration = video_info.get('duration')
+        thumbnail = video_info.get('asset_url')
+
+        m3u8_headers = {
+            'Origin': self._flo_origin,
+            'Referer': f'{self._flo_origin}/',
+        }
+
+        formats, subtitles = self._extract_m3u8_formats_and_subtitles(
+            playlist_url, video_id, 'mp4',
+            entry_protocol='m3u8_native',
+            m3u8_id='hls',
+            headers=m3u8_headers,
+            live=False,
+            fatal=False,
+        )
+
+        if not formats:
+            self.report_warning('No formats extracted from CloudFront manifest.')
+            return None
+
+        return {
+            'id': video_id,
+            'title': title,
+            'duration': duration,
+            'thumbnail': thumbnail,
+            'formats': formats,
+            'subtitles': subtitles,
+            'live_status': 'was_live',
+            'is_live': False,
+        }
+
     def _real_extract(self, url):
         mobj = self._match_valid_url(url)
         event_id = mobj.group('id')
         content_type = mobj.group('type')
 
         is_live = content_type == 'live'
+
+        # VOD: use the public video API (no auth needed, has audio)
         if not is_live:
-            self.report_warning('VOD extraction is experimental and may not work correctly')
+            vod_result = self._extract_vod(event_id)
+            if vod_result:
+                return vod_result
+            self.report_warning('VOD API extraction failed, falling back to stream token flow')
 
         # Parse extractor arguments
         args = self._get_extractor_args()
