@@ -43,7 +43,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dynamic = ["version"]
-dependencies = []
+dependencies = [
+    "curl-cffi>=0.5.10,!=0.6.*,!=0.7.*,!=0.8.*,!=0.9.*,<0.16 ; implementation_name == 'cpython'",
+]
 
 [project.optional-dependencies]
 default = [

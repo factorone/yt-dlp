@@ -126,6 +126,7 @@ class FloSportsBaseIE(InfoExtractor):
             headers=headers,
             data=json.dumps(payload).encode('utf-8'),
             note=f'Getting stream token for stream {stream_id}',
+            impersonate=True,
         )
 
     def _get_event_title(self, event_id, webpage):
@@ -141,6 +142,7 @@ class FloSportsBaseIE(InfoExtractor):
                     schedule_url, event_id,
                     note='Getting event title from API',
                     fatal=False,
+                    impersonate=True,
                 )
                 if schedule_html:
                     title_match = self._search_regex(
@@ -183,6 +185,7 @@ class FloSportsBaseIE(InfoExtractor):
             api_url, video_id,
             note='Fetching video metadata from FloSports API',
             fatal=False,
+            impersonate=True,
         )
 
         if not video_data:
@@ -267,8 +270,11 @@ class FloSportsBaseIE(InfoExtractor):
         # Get JWT token from browser cookies
         jwt_token = self._get_jwt_token()
 
-        # Download the main webpage
-        webpage = self._download_webpage(url, event_id)
+        # Download the main webpage. FloSports' edge (Akamai bot manager) 406s
+        # non-browser TLS fingerprints, so impersonate a real browser via curl_cffi.
+        # require_impersonation makes a missing curl_cffi fail loud here instead of
+        # silently falling back to a plain request that gets 406'd downstream.
+        webpage = self._download_webpage(url, event_id, impersonate=True, require_impersonation=True)
 
         # Extract and decode the flo-app-state JSON
         app_state_script = self._search_regex(
