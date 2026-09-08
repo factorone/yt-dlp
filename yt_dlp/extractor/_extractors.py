@@ -674,6 +674,7 @@ from .gettr import (
     GettrStreamingIE,
 )
 from .giantbomb import GiantBombIE
+from .gideo import Box5TVIE
 from .glide import GlideIE
 from .globalplayer import (
     GlobalPlayerAudioEpisodeIE,
