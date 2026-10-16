@@ -1,106 +1,72 @@
-import datetime
-import time
+import re
+import urllib.parse
 
 from .common import InfoExtractor
-from ..utils import ExtractorError
+from ..utils import (
+    ExtractorError,
+    clean_html,
+    url_or_none,
+)
+from ..utils.traversal import traverse_obj
 
 
-class GideoStreamotorBaseIE(InfoExtractor):
+class Box5TVIE(InfoExtractor):
     """
-    Base extractor for channels on the Gideo / Streamotor white-label OTT platform.
+    Box5 TV (marching bands, drum corps, color guard), a channel on the Gideo /
+    Streamotor white-label OTT platform.
 
-    Gideo (gideo.video, "Gideo.TV") powers a family of branded channels (Box5 TV,
-    BizTV, HockeyTV, YogaVibes, Gaither TV, ...). They share one backend:
-        API : https://api.streamotor.com/api/v1  (HTTP Basic Auth, realm="sm")
-        CDN : https://cdn.gideo.video           (Fastly over S3/B2, path-based, likely signed)
-    Delivery appears to be token-gated clear HLS (no DRM indicators observed).
+    Box5 fronts Streamotor with a WordPress/WooCommerce + aMember paywall. The watch
+    page at `/watch/?stream=<id>&stream-type=<multi|high>` embeds the Streamotor
+    player - a script at `app.streamotor.com/player/v2/embed.php` whose `livesrc`
+    query param carries the (already entitled) HLS master URL - but only for a
+    logged-in, entitled session; otherwise it 302s to the login page. So a session
+    cookie (PHPSESSID on .box5tv.com) is required: pass --cookies-from-browser or
+    --cookies cookies.txt.
 
-    Child classes must define:
-        _CHANNEL_DOMAIN   : str  - e.g. 'box5tv.com'
-        _CHANNEL_NAME     : str  - human-readable, e.g. 'Box5 TV'
-    and may override _API_BASE / _CDN_BASE if a channel is pinned to different hosts.
+    Each `stream-type` is a distinct camera angle with its own manifest and token, so
+    a full multicam capture resolves every angle the event offers. Delivery is clear
+    HLS (no DRM); the Fastly-fronted origin gates only the master playlist on the
+    opaque `?t=` token and serves the media segments openly.
 
-    NOTE (Phase 1/2): the content->manifest mapping, the Basic credential, and the
-    per-user entitlement/token exchange are not observable from outside the app.
-    They are isolated behind three seams below and must be filled from static app
-    analysis (jadx on video.gideo.box5tv) and/or a logged-in live capture:
-        _get_session_token()   - user entitlement
-        _resolve_streams()     - content id -> [{id, name, manifest_url}]
-    Everything else (URL matching, extractor-args, DVR lookback, HLS assembly) is done.
+    DVR: the entitled master manifest is itself a rolling DVR playlist (several hours
+    of back-content). Use `--live-from-start` to pull from the oldest available
+    segment; this origin has no query-param seek. For arbitrary-range after-the-fact
+    recovery, see scripts/recover_box5.ps1.
     """
-    _CHANNEL_DOMAIN = None   # Must be overridden
-    _CHANNEL_NAME = None     # Must be overridden
+    IE_NAME = 'box5tv'
+    _CHANNEL_NAME = 'Box5 TV'
+    _ORIGIN = 'https://box5tv.com'
+    _EMBED_HOST = 'app.streamotor.com'
 
-    # Confirmed Streamotor/Gideo API surfaces (from static analysis of the Android app
-    # video.gideo.box5tv v2.5.0, package com.imavex.channelapp):
-    #   _LEGACY_API_BASE : the app's REST API. Endpoints are POST routes (authenticate,
-    #                      getChannel, getVideos, subscriberbehavior). GET 404s.
-    #   _ROKU_FEED       : older Roku-style XML feed, GET ?cmd=getVideos&ScheduleID=<id>.
-    #   _API_BASE (v1)   : newest REST API, HTTP Basic Auth (realm "sm"); web player path.
-    #   _CDN_BASE        : object-storage origin the manifests point at (returned by the
-    #                      API, not hardcoded). Delivery is ExoPlayer clear HLS.
-    _LEGACY_API_BASE = 'https://ott.gideo.video/api/legacy'
-    _ROKU_FEED = 'https://iptv.streamotor.com/roku.xml'
-    _API_BASE = 'https://api.streamotor.com/api/v1'
-    _CDN_BASE = 'https://cdn.gideo.video'
-
-    # Per-channel API key ("ApiKey cannot be null" / getApiKey in the app). Identifies
-    # the Box5 channel to the API. Value is not a plain resource literal; TODO Phase 1/2:
-    # recover via full DEX decompile (jadx) or by observing a logged-in request.
-    _CHANNEL_APIKEY = None
-
-    # Cookie names the web player might use to carry the logged-in session. aMember
-    # sets PHPSESSID on .box5tv.com; the Streamotor handoff token name is TBD (RE).
-    _SESSION_COOKIE_NAMES = ('PHPSESSID',)
-
-    # DVR seek query param on the HLS origin. Unconfirmed (Flo uses 'start'); the only
-    # thing to change in Phase 2 if Streamotor differs (e.g. 'begin'/'dvr').
-    _LOOKBACK_PARAM = 'start'
-
-    @property
-    def _origin(self):
-        return f'https://{self._CHANNEL_DOMAIN}'
-
-    # -- Generic helpers (copy-adapted from flosports.py; intentionally NOT imported,
-    #    to keep this provider fully decoupled from the Flo code) -------------------
+    # The id lives in the query (stream=<numeric id>); the angle is stream-type.
+    _VALID_URL = r'https?://(?:www\.)?box5tv\.com/watch/?\?(?:[^#]*&)?stream=(?P<id>\d+)'
+    _TESTS = [{
+        'url': 'https://box5tv.com/watch/?stream=38418&stream-type=multi',
+        'only_matching': True,
+    }, {
+        'url': 'https://box5tv.com/watch/?stream=38418&stream-type=high',
+        'only_matching': True,
+    }, {
+        # Order of query params must not matter.
+        'url': 'https://box5tv.com/watch/?stream-type=multi&stream=36272',
+        'only_matching': True,
+    }]
 
     def _get_extractor_args(self):
         """
         Parse extractor-specific arguments.
 
-        Usage: --extractor-args "box5tv:stream_name=Main Camera,delay_minutes=5,lookback_minutes=10"
+        Usage: --extractor-args "box5tv:stream_name=High Cam"
+
+        `stream_name` picks a single camera angle out of a multicam event (matched
+        case-insensitively, exact before partial). Absent, every angle is returned.
         """
-        # casesense=True preserves the camera name's original case for display;
+        # casesense=True preserves the angle name's original case for display;
         # matching in _filter_stream_by_name is case-insensitive regardless.
         stream_name_list = self._configuration_arg('stream_name', [], casesense=True)
-        delay_list = self._configuration_arg('delay_minutes', ['0'])
-        lookback_list = self._configuration_arg('lookback_minutes', ['0'])
-
         return {
             'stream_name': stream_name_list[0] if stream_name_list else None,
-            'delay_minutes': int(delay_list[0]),
-            'lookback_minutes': int(lookback_list[0]),
         }
-
-    def _apply_time_parameters(self, stream_uri, lookback_minutes=0):
-        """
-        Seek an HLS live edge backwards by N minutes, if the origin supports it.
-
-        Flo's Wowza/Transmit origins accept ?start=UNIX. Streamotor's DVR parameter
-        name is unconfirmed (TODO Phase 2: verify against a live cdn.gideo.video edge;
-        it may be ?start=, ?begin=, or ?dvr=). Kept generic via _LOOKBACK_PARAM so the
-        only thing to change later is a class attribute.
-        """
-        if lookback_minutes <= 0:
-            return stream_uri
-
-        separator = '&' if '?' in stream_uri else '?'
-        lookback_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=lookback_minutes)
-        unix_timestamp = int(lookback_time.timestamp())
-        modified_uri = f'{stream_uri}{separator}{self._LOOKBACK_PARAM}={unix_timestamp}'
-
-        self.to_screen(f'Attempting to seek back {lookback_minutes} minutes to {lookback_time.strftime("%H:%M:%S UTC")}')
-        return modified_uri
 
     def _filter_stream_by_name(self, stream_list, target_name):
         """Filter a multicam stream list by (case-insensitive) name, exact then partial."""
@@ -125,68 +91,79 @@ class GideoStreamotorBaseIE(InfoExtractor):
         self.report_warning(f'Stream "{target_name}" not found. Available streams: {", ".join(available_streams)}')
         return stream_list
 
-    # -- Auth / API seams (Phase 1 RE + Phase 2 live capture) ----------------------
+    def _watch_url(self, video_id, stream_type):
+        return f'{self._ORIGIN}/watch/?stream={video_id}&stream-type={stream_type}'
 
-    def _get_session_token(self):
+    def _master_url_from_embed(self, html, note_source):
         """
-        Return whatever the Streamotor playback API needs to authorize this user.
+        Pull the HLS master manifest URL out of the Streamotor player embed.
 
-        Confirmed auth surfaces (app RE):
-          - REST: POST {_LEGACY_API_BASE}/authenticate with
-                {username, password, apiKey, deviceId} -> authToken
-                (the app also supports Google Play IAP: authenticateByReceipt).
-          - Web: aMember session cookie on .box5tv.com (PHPSESSID), handed to the
-                Streamotor player. Cookie->token handoff name still TBD.
-
-        Default (mirrors the Flo cookies-from-browser posture): read the browser
-        session cookie. TODO Phase 1/2: wire the REST authenticate flow (needs the
-        channel _CHANNEL_APIKEY) and/or confirm the web cookie->token exchange.
+        The embed is `.../embed.php?livesrc=<urlencoded manifest>&...`; the manifest
+        value is percent-encoded (so it contains no raw '&') and already carries its
+        own `?t=` entitlement token. Returns None if no embed is present, so callers
+        can tell "not entitled / wrong page" apart from a hard failure.
         """
-        cookies = self._get_cookies(self._origin)
-        for name in self._SESSION_COOKIE_NAMES:
-            cookie = cookies.get(name)
-            if cookie and cookie.value:
-                return cookie.value
+        match = re.search(
+            rf'{re.escape(self._EMBED_HOST)}/player/v2/embed\.php\?livesrc=(?P<src>[^&"\']+)',
+            html)
+        if not match:
+            return None
 
-        raise ExtractorError(
-            f'No {self._CHANNEL_NAME} session cookie found. Log into {self._origin} in your '
-            f'browser and pass --cookies-from-browser, then retry.',
-            expected=True,
-        )
+        manifest_url = urllib.parse.unquote(match.group('src'))
+        if not url_or_none(manifest_url):
+            self.report_warning(f'Found a Streamotor embed on {note_source} but its livesrc was not a URL')
+            return None
+        return manifest_url
 
-    def _resolve_streams(self, video_id, is_live):
+    def _angles_for_stream(self, html, video_id):
         """
-        Map a content id to a list of playable streams:
-            [{'id': str, 'name': str, 'manifest_url': str}, ...]
+        Discover the camera angles offered for this stream from the watch page.
 
-        Two confirmed candidate paths (app RE), both returning the HLS manifest URL(s)
-        that the API points at cdn.gideo.video (URLs are server-provided, not built here):
-          A) REST : POST {_LEGACY_API_BASE}/getVideos with {apiKey, videoId|streamId,
-                    authToken, deviceId} -> JSON with the stream/manifest URL(s).
-          B) Roku : GET {_ROKU_FEED}?cmd=getVideos&ScheduleID=<id> -> XML listing.
-
-        Blocked on two inputs that need either a full DEX decompile or a logged-in
-        session: the channel _CHANNEL_APIKEY and a valid authToken/session. Fails
-        loud-but-clear rather than guessing, so no wrong endpoint ships.
+        The page lists them as anchors
+            <a ... href=".../watch/?stream=<id>&#038;stream-type=<type>">Label</a>
+        (&#038; is an HTML-encoded '&'). Scoped to video_id so we don't pick up the
+        other events' cards. Returns an ordered, de-duplicated [(stream_type, label)].
         """
-        if not self._CHANNEL_APIKEY:
-            raise ExtractorError(
-                f'{self._CHANNEL_NAME} playback needs the channel apiKey and a logged-in '
-                'session, which are pending reverse-engineering (see box5-capture '
-                'docs/streamotor-api-notes.md). URL matching, extractor-args, DVR '
-                'lookback, and HLS assembly are all wired and ready.',
-                expected=True,
-            )
-        raise ExtractorError('Gideo/Streamotor stream resolution not yet implemented', expected=True)
+        pattern = (
+            rf'/watch/\?stream={re.escape(video_id)}(?:&#0?38;|&amp;|&)stream-type='
+            r'(?P<type>[a-z0-9-]+)"[^>]*>(?P<label>[^<]+)</a>')
+        angles, seen = [], set()
+        for m in re.finditer(pattern, html):
+            stream_type = m.group('type')
+            if stream_type in seen:
+                continue
+            seen.add(stream_type)
+            angles.append((stream_type, clean_html(m.group('label')).strip()))
+        return angles
 
-    def _extract_from_manifest(self, manifest_url, video_id, is_live, display_name, lookback_minutes=0):
-        """Build yt-dlp formats/subtitles from one HLS manifest URL. Fully implemented."""
-        if lookback_minutes > 0 and is_live:
-            manifest_url = self._apply_time_parameters(manifest_url, lookback_minutes)
+    def _event_title(self, html):
+        """
+        Best-effort event title from the selected schedule card, which carries the
+        round and venue, e.g. a card holding box5-event-stage "PRELIMS" and
+        box5-card-schedule__name "Fairfield Jr./Sr. H.S., IN" -> "PRELIMS - Fairfield
+        Jr./Sr. H.S., IN". Falls back to og:title/<title> if the card isn't found.
+        """
+        card = self._search_regex(
+            r'(<li[^>]*box5-event-card--selected.*?</li>)',
+            html, 'event card', default=None, flags=re.DOTALL)
+        if card:
+            stage = self._search_regex(
+                r'class="box5-event-stage"[^>]*>([^<]+)', card, 'stage', default=None)
+            venue = self._search_regex(
+                r'class="box5-card-schedule__name"[^>]*>([^<]+)', card, 'venue', default=None)
+            parts = [clean_html(p).strip() for p in (stage, venue) if p]
+            if parts:
+                return ' - '.join(parts)
+        return self._og_search_title(html, default=None) or self._html_extract_title(html, default=None)
 
+    def _extract_from_manifest(self, manifest_url, video_id, is_live, display_name):
+        """Build yt-dlp formats/subtitles from one HLS master URL."""
+        # The CDN gates only the master on the ?t= token and serves segments openly;
+        # no Origin/Referer is required, but sending them matches the real player and
+        # costs nothing if the origin ever tightens.
         headers = {
-            'Origin': self._origin,
-            'Referer': f'{self._origin}/',
+            'Origin': self._ORIGIN,
+            'Referer': f'{self._ORIGIN}/',
         }
         formats, subtitles = self._extract_m3u8_formats_and_subtitles(
             manifest_url, video_id, 'mp4',
@@ -196,32 +173,86 @@ class GideoStreamotorBaseIE(InfoExtractor):
             live=is_live,
             fatal=False,
         )
-        # Label formats with the camera/stream name so multicam captures are selectable.
-        slug = display_name.replace(' ', '_').lower()
+        # Label formats with the angle name so multicam captures are selectable and
+        # their format ids stay unique across angles (e.g. "hls-1080-high_cam").
+        slug = re.sub(r'\W+', '_', display_name).strip('_').lower()
         for fmt in formats:
             fmt['format_note'] = display_name
             if 'format_id' in fmt:
                 fmt['format_id'] = f'{fmt["format_id"]}-{slug}'
         return formats, subtitles
 
-    # -- Orchestration -------------------------------------------------------------
+    def _resolve_one(self, video_id, stream_type, label, html=None):
+        """Resolve a single angle to a stream dict, fetching its page unless supplied."""
+        if html is None:
+            html = self._download_webpage(
+                self._watch_url(video_id, stream_type), video_id,
+                note=f'Downloading {label} watch page',
+                errnote=f'Could not load {label} watch page')
+
+        manifest_url = self._master_url_from_embed(html, f'{label} page')
+        if not manifest_url:
+            self.report_warning(
+                f'No entitled Streamotor embed for "{label}" (stream {video_id}). '
+                f'Confirm your {self._CHANNEL_NAME} login covers this event.')
+            return None
+
+        # A live DVR playlist has no #EXT-X-ENDLIST; once the event ends the origin
+        # adds it and the asset becomes VOD. Non-fatal: default to live on any hiccup.
+        media = self._download_webpage(
+            manifest_url, video_id, note=f'Checking {label} manifest state',
+            errnote=False, fatal=False)
+        is_live = '#EXT-X-ENDLIST' not in (media or '')
+        return {
+            'id': f'{video_id}-{stream_type}',
+            'name': label,
+            'manifest_url': manifest_url,
+            'is_live': is_live,
+            'event_title': self._event_title(html),
+        }
+
+    def _resolve_streams(self, url, video_id):
+        """Map a watch URL to [{'id','name','manifest_url','is_live','event_title'}]."""
+        requested_type = traverse_obj(urllib.parse.parse_qs(
+            urllib.parse.urlparse(url).query), ('stream-type', 0))
+
+        # Download the requested page once (default to the multi angle), detecting the
+        # login redirect that means "not logged in / not entitled".
+        first_type = requested_type or 'multi'
+        html, urlh = self._download_webpage_handle(
+            self._watch_url(video_id, first_type), video_id,
+            note='Downloading watch page')
+        if '/login' in urlh.url or '_amember_redirect_url' in urlh.url:
+            raise ExtractorError(
+                f'{self._CHANNEL_NAME} redirected to login. Log into {self._ORIGIN} in your '
+                'browser and pass --cookies-from-browser (or --cookies cookies.txt), then retry.',
+                expected=True)
+
+        angles = self._angles_for_stream(html, video_id)
+        # If the user pinned a stream-type, honour only that; otherwise capture every
+        # angle the page offers (falling back to the one we fetched if none parsed).
+        if requested_type:
+            angles = [(t, lbl) for t, lbl in angles if t == requested_type] \
+                or [(requested_type, requested_type.title())]
+        elif not angles:
+            angles = [(first_type, first_type.title())]
+
+        streams = []
+        for stream_type, label in angles:
+            # Reuse the page we already have for the one we fetched.
+            page = html if stream_type == first_type else None
+            resolved = self._resolve_one(video_id, stream_type, label, html=page)
+            if resolved:
+                streams.append(resolved)
+        return streams
 
     def _real_extract(self, url):
-        mobj = self._match_valid_url(url)
-        video_id = mobj.group('id')
-        content_type = mobj.group('type')
-        is_live = content_type == 'live'
+        video_id = self._match_id(url)
 
         args = self._get_extractor_args()
         stream_name = args.get('stream_name')
-        delay_minutes = args.get('delay_minutes', 0)
-        lookback_minutes = args.get('lookback_minutes', 0)
 
-        if delay_minutes > 0:
-            self.to_screen(f'Waiting {delay_minutes} minutes before starting extraction...')
-            time.sleep(delay_minutes * 60)
-
-        streams = self._resolve_streams(video_id, is_live)
+        streams = self._resolve_streams(url, video_id)
         if stream_name:
             streams = self._filter_stream_by_name(streams, stream_name)
         if not streams:
@@ -231,12 +262,9 @@ class GideoStreamotorBaseIE(InfoExtractor):
         for stream in streams:
             manifest_url = stream.get('manifest_url')
             display_name = stream.get('name') or f'Stream {stream.get("id")}'
-            if not manifest_url:
-                self.report_warning(f'No manifest URL for stream {stream.get("id")}')
-                continue
             try:
                 s_formats, s_subs = self._extract_from_manifest(
-                    manifest_url, video_id, is_live, display_name, lookback_minutes)
+                    manifest_url, video_id, stream.get('is_live', True), display_name)
             except ExtractorError as e:
                 self.report_warning(f'Failed to extract stream {stream.get("id")} ({display_name}): {e}')
                 continue
@@ -246,41 +274,18 @@ class GideoStreamotorBaseIE(InfoExtractor):
         if not formats:
             raise ExtractorError('No playable streams found')
 
-        title = video_id
+        # Prefer a real event title (the venue/show on the watch page) over the id,
+        # and append the single angle's name when exactly one was requested.
+        title = traverse_obj(streams, (0, 'event_title')) or video_id
         if stream_name and len(streams) == 1:
             title = f'{title} - {streams[0].get("name", stream_name)}'
 
+        is_live = bool(traverse_obj(streams, (0, 'is_live')))
         return {
             'id': video_id,
-            'title': title,  # TODO Phase 1: pull real title from the Streamotor metadata
+            'title': title,
             'formats': formats,
             'subtitles': subtitles,
             'live_status': 'is_live' if is_live else 'was_live',
             'is_live': is_live,
         }
-
-
-class Box5TVIE(GideoStreamotorBaseIE):
-    """Box5 TV (marching bands, drum corps, color guard) on the Gideo/Streamotor platform."""
-    IE_NAME = 'box5tv'
-    _CHANNEL_DOMAIN = 'box5tv.com'
-    _CHANNEL_NAME = 'Box5 TV'
-
-    # NOTE: the authenticated watch-URL scheme is behind the aMember paywall and
-    # unconfirmed. This provisional pattern covers the livestream subdomain and the
-    # apex with a type segment + id/slug. TODO Phase 2: confirm real live/VOD URLs.
-    _VALID_URL = r'''(?x)
-        https?://(?:www\.|livestream\.)?box5tv\.com/
-        (?:livestream/)?
-        (?P<type>live|video|vod|watch|event)/(?P<id>[\w-]+)'''
-    _TESTS = [{
-        # Provisional URL shapes (only_matching until the real scheme is confirmed).
-        'url': 'https://livestream.box5tv.com/live/12345',
-        'only_matching': True,
-    }, {
-        'url': 'https://box5tv.com/video/12345-boa-grand-nationals-2025',
-        'only_matching': True,
-    }, {
-        'url': 'https://livestream.box5tv.com/watch/some-event-slug',
-        'only_matching': True,
-    }]
